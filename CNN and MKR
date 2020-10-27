@@ -1,0 +1,459 @@
+# -*- coding: utf-8 -*-
+
+
+import os
+import numpy as np
+import tensorflow as tf
+from layers import Dense, CrossCompressUnit
+from sklearn.metrics import roc_auc_score
+
+tf.reset_default_graph()
+
+def load_data():
+    n_user, n_item, train_data, eval_data, test_data = load_rating()
+    n_entity, n_relation, kg = load_kg()
+    print('data loaded.')
+
+    return n_user, n_item, n_entity, n_relation, train_data, eval_data, test_data, kg
+
+
+def load_rating():
+    print('reading rating file ...')
+
+    # reading rating file
+    rating_file = '../data/ratings_final'
+    if os.path.exists(rating_file + '.npy'):
+        rating_np = np.load(rating_file + '.npy')
+    else:
+        rating_np = np.loadtxt(rating_file + '.txt', dtype=np.int32)
+        np.save(rating_file + '.npy', rating_np)
+
+    n_user = len(set(rating_np[:, 0]))
+    n_item = len(set(rating_np[:, 1]))
+    train_data, eval_data, test_data = dataset_split(rating_np)
+
+    return n_user, n_item, train_data, eval_data, test_data
+
+
+def dataset_split(rating_np):
+    print('splitting dataset ...')
+
+    # train:eval:test = 6:2:2
+    eval_ratio = 0.2
+    test_ratio = 0.2
+    n_ratings = rating_np.shape[0]
+
+    eval_indices = np.random.choice(list(range(n_ratings)), size=int(n_ratings * eval_ratio), replace=False)
+    left = set(range(n_ratings)) - set(eval_indices)
+    test_indices = np.random.choice(list(left), size=int(n_ratings * test_ratio), replace=False)
+    train_indices = list(left - set(test_indices))
+
+    train_data = rating_np[train_indices]
+    eval_data = rating_np[eval_indices]
+    test_data = rating_np[test_indices]
+
+    return train_data, eval_data, test_data
+
+
+def load_kg():
+    print('reading KG file ...')
+
+    # reading kg file
+    # kg_final1.txt是head, relation, tail,  再加15个title词向量的数据， kg_final.txt只是三元组信息（head, relation, tail）
+    kg_file = '../data/kg_final1'
+    if os.path.exists(kg_file + '.npy'):
+        kg = np.load(kg_file + '.npy')
+    else:
+        kg = np.loadtxt(kg_file + '.txt', dtype=np.int32)
+        np.save(kg_file + '.npy', kg)
+
+    n_entity = len(set(kg[:, 0]) | set(kg[:, 2]))
+    n_relation = len(set(kg[:, 1]))
+
+    return n_entity, n_relation, kg
+
+# load data
+n_user, n_item, n_entity, n_relation, train_data, eval_data, test_data, kg=load_data()
+
+# 定义输入的占位符
+user_indices = tf.placeholder(tf.int32, [None], 'user_indices')
+item_indices = tf.placeholder(tf.int32, [None], 'item_indices')
+labels = tf.placeholder(tf.float32, [None], 'labels')
+head_indices = tf.placeholder(tf.int32, [None], 'head_indices')
+tail_indices = tf.placeholder(tf.int32, [None], 'tail_indices')
+relation_indices = tf.placeholder(tf.int32, [None], 'relation_indices')
+movie_titles = tf.placeholder(tf.int32, [None, 15], name="movie_titles")
+
+vars_rs=[]
+vars_kge=[]
+
+dim = 8
+#电影ID个数
+movie_id_max = 3952
+#电影名单词个数
+movie_title_max = 5217
+#电影名长度
+sentences_size = 15 # = 15
+#文本卷积滑动窗口，分别滑动2, 3, 4, 5个单词
+window_sizes = {2, 3, 4, 5}
+#文本卷积核数量
+filter_num = 8
+
+num_low_layer=1
+num_high_layer=1
+l2_weight=1e-6
+lr_rs=0.02
+lr_kge=0.01
+batch_size=4096
+n_epochs=10
+kge_interval=3
+
+
+show_loss=False
+show_topk =False
+
+'''
+def get_movie_embed_layer():
+    #从嵌入矩阵中得到电影名对应的各个单词的嵌入向量
+    with tf.name_scope("movie_embedding"):
+        movie_title_embed_matrix = tf.Variable(tf.random_uniform([movie_title_max, dim], -1, 1), name = "movie_title_embed_matrix")
+        movie_title_embed_layer = tf.nn.embedding_lookup(movie_title_embed_matrix, movie_titles, name = "movie_title_embed_layer")
+        movie_title_embed_layer_expand = tf.expand_dims(movie_title_embed_layer, -1)
+    
+    #对文本嵌入层使用不同尺寸的卷积核做卷积和最大池化
+    pool_layer_lst = []
+    for window_size in window_sizes:
+        with tf.name_scope("movie_txt_conv_maxpool_{}".format(window_size)):
+            filter_weights = tf.Variable(tf.truncated_normal([window_size, dim, 1, filter_num],stddev=0.1),name = "filter_weights")
+            filter_bias = tf.Variable(tf.constant(0.1, shape=[filter_num]), name="filter_bias")
+            
+            conv_layer = tf.nn.conv2d(movie_title_embed_layer_expand, filter_weights, [1,1,1,1], padding="VALID", name="conv_layer")
+            relu_layer = tf.nn.relu(tf.nn.bias_add(conv_layer,filter_bias), name ="relu_layer")
+            
+            maxpool_layer = tf.nn.max_pool(relu_layer, [1,sentences_size - window_size + 1 ,1,1], [1,1,1,1], padding="VALID", name="maxpool_layer")
+            pool_layer_lst.append(maxpool_layer)
+    #Dropout层
+    with tf.name_scope("pool_dropout"):
+        pool_layer = tf.concat(pool_layer_lst, 3, name ="pool_layer")
+        max_num = len(window_sizes) * filter_num
+        pool_layer_flat = tf.reshape(pool_layer , [-1, 1, max_num], name = "pool_layer_flat")
+    
+        dropout_layer = tf.nn.dropout(pool_layer_flat, 0.5, name = "dropout_layer")
+    
+    return dropout_layer
+
+def get_movie_cnn_layer():
+    #从嵌入矩阵中得到电影名对应的各个单词的嵌入向量
+    with tf.name_scope("movie_embedding"):
+        movie_title_embed_matrix = tf.Variable(tf.random_uniform([movie_title_max, dim], -1, 1), name = "movie_title_embed_matrix")
+        movie_title_embed_layer = tf.nn.embedding_lookup(movie_title_embed_matrix, movie_titles, name = "movie_title_embed_layer")
+        movie_title_embed_layer_expand = tf.expand_dims(movie_title_embed_layer, -1)
+    
+    #对文本嵌入层使用不同尺寸的卷积核做卷积和最大池化
+    pool_layer_lst = []
+    for window_size in window_sizes:
+        with tf.name_scope("movie_txt_conv_maxpool_{}".format(window_size)):
+            filter_weights = tf.Variable(tf.truncated_normal([window_size, dim, 1, filter_num],stddev=0.1),name = "filter_weights")
+            filter_bias = tf.Variable(tf.constant(0.1, shape=[filter_num]), name="filter_bias")
+            
+            conv_layer = tf.nn.conv2d(movie_title_embed_layer_expand, filter_weights, [1,1,1,1], padding="VALID", name="conv_layer")
+            relu_layer = tf.nn.relu(tf.nn.bias_add(conv_layer,filter_bias), name ="relu_layer")
+            
+            maxpool_layer = tf.nn.max_pool(relu_layer, [1,sentences_size - window_size + 1 ,1,1], [1,1,1,1], padding="VALID", name="maxpool_layer")
+            pool_layer_lst.append(maxpool_layer)
+    #Dropout层
+    with tf.name_scope("pool_dropout"):
+        pool_layer = tf.concat(pool_layer_lst, 3, name ="pool_layer")
+        max_num = len(window_sizes) * filter_num
+        pool_layer_flat = tf.reshape(pool_layer , [-1, 1, max_num], name = "pool_layer_flat")
+    
+        dropout_layer = tf.nn.dropout(pool_layer_flat, 0.5, name = "dropout_layer")
+    
+    return dropout_layer
+
+'''
+
+'''
+#使用嵌入之后再加CNN的
+def get_movie_feature_layer(movie_id_embeddings, movie_title_embeddings):
+    with tf.name_scope("movie_fc"):
+        movie_id_fc_layer = tf.layers.dense(movie_id_embed_layer, dim, name = "movie_id_fc_layer", activation=tf.nn.relu)
+        movie_combine_layer = tf.concat([movie_id_fc_layer, dropout_layer], 2)  
+        movie_combine_layer = tf.contrib.layers.fully_connected(movie_combine_layer, dim, tf.tanh) 
+    
+        movie_combine_layer_flat = tf.reshape(movie_combine_layer, [-1, dim])
+    return movie_combine_layer_flat
+
+'''
+
+# 只使用嵌入的
+def get_movie_feature_layer(movie_id_embeddings, movie_title_embeddings):
+    with tf.name_scope("movie_fc"):
+        #对movie_title做一个加和操作,以便和id进行联合
+        movie_title_embeddings = tf.reduce_sum(movie_title_embeddings, axis=1, keep_dims=True)
+        movie_title_embeddings = tf.reshape(movie_id_embeddings, [-1, dim])
+        movie_combine_layer = tf.concat([movie_id_embeddings, movie_title_embeddings], 1)  #(?, 1, 1+15)
+        movie_combine_layer = tf.contrib.layers.fully_connected(movie_combine_layer, dim, tf.tanh)  #(?, 1, dim)
+        
+        movie_combine_layer_flat = tf.reshape(movie_combine_layer, [-1, dim])
+    return movie_combine_layer_flat
+
+
+'''
+movie_title_embed_matrix = tf.Variable(tf.random_uniform([movie_title_max, dim], -1, 1), name = "movie_title_embed_matrix")
+movie_title_embed_layer = tf.nn.embedding_lookup(movie_title_embed_matrix, movie_titles, name = "movie_title_embed_layer")
+movie_title_embed_layer_expand = tf.expand_dims(movie_title_embed_layer, -1)
+'''
+movie_title_emb_matrix=tf.get_variable('movie_title_emb_matrix', [movie_title_max, dim])
+movie_title_embeddings=tf.nn.embedding_lookup(movie_title_emb_matrix, movie_titles)
+
+# 创建变量
+user_emb_matrix = tf.get_variable('user_emb_matrix', [n_user, dim])
+item_emb_matrix = tf.get_variable('item_emb_matrix', [n_item, dim])
+entity_emb_matrix = tf.get_variable('entity_emb_matrix', [n_entity, dim])
+relation_emb_matrix = tf.get_variable('relation_emb_matrix', [n_relation, dim])
+
+user_embeddings = tf.nn.embedding_lookup(user_emb_matrix, user_indices)
+item_embeddings = tf.nn.embedding_lookup(item_emb_matrix, item_indices)
+
+item_embeddings_final=get_movie_feature_layer(item_embeddings, movie_title_embeddings)
+
+head_embeddings = tf.nn.embedding_lookup(entity_emb_matrix, head_indices)
+relation_embeddings = tf.nn.embedding_lookup(relation_emb_matrix, relation_indices)
+tail_embeddings = tf.nn.embedding_lookup(entity_emb_matrix, tail_indices)
+
+for _ in range(num_low_layer):
+    user_mlp = Dense(input_dim=dim, output_dim=dim)
+    tail_mlp = Dense(input_dim=dim, output_dim=dim)
+    cc_unit = CrossCompressUnit(dim)
+    user_embeddings = user_mlp(user_embeddings)
+    
+    item_embeddings, head_embeddings = cc_unit([item_embeddings_final, head_embeddings])
+    #item_embeddings, head_embeddings = cc_unit([item_embeddings, head_embeddings])
+    tail_embeddings = tail_mlp(tail_embeddings)
+    
+    vars_rs.extend([user_embeddings])
+    vars_rs.extend(cc_unit.vars)
+    vars_kge.extend(tail_mlp.vars)
+    vars_kge.extend(cc_unit.vars)
+
+user_inner_produce=True
+
+# RS
+if user_inner_produce:
+    scores=tf.reduce_mean(user_embeddings * item_embeddings, axis=1)
+else:
+    user_item_concat=tf.concat([user_embeddings, item_embeddings], axis=1)
+    for _ in range(num_high_layer-1):
+        rs_mlp=Dense(input_dim=dim * 2, output_dim=dim * 2)
+        user_item_concat=rs_mlp(user_item_concat)
+        vars_rs.extend(rs_mlp.vars)
+        
+    rs_pred_mlp=Dense(input_dim=dim * 2, output_dim=1)
+    scores=tf.squeeze(rs_pred_mlp(user_item_concat))
+    vars_rs.extend(rs_pred_mlp.vars)
+scores_normalized=tf.nn.sigmoid(scores)
+
+# KGE
+head_relation_concat = tf.concat([head_embeddings, relation_embeddings], axis=1)
+for _ in range(num_high_layer- 1):
+    kge_mlp = Dense(input_dim=dim * 2, output_dim=dim * 2)
+    # [batch_size, dim]
+    head_relation_concat = kge_mlp(head_relation_concat)
+    vars_kge.extend(kge_mlp.vars)
+
+kge_pred_mlp = Dense(input_dim=dim * 2, output_dim=dim)
+# [batch_size, 1]
+tail_pred = kge_pred_mlp(head_relation_concat)
+vars_kge.extend(kge_pred_mlp.vars)
+tail_pred = tf.nn.sigmoid(tail_pred)
+
+scores_kge = tf.nn.sigmoid(tf.reduce_sum(tail_embeddings * tail_pred, axis=1))
+rmse = tf.reduce_mean(
+    tf.sqrt(tf.reduce_sum(tf.square(tail_embeddings - tail_pred), axis=1) / dim))
+
+
+# RS
+base_loss_rs = tf.reduce_mean(
+    tf.nn.sigmoid_cross_entropy_with_logits(labels=labels, logits=scores))
+l2_loss_rs = tf.nn.l2_loss(user_embeddings) + tf.nn.l2_loss(item_embeddings)
+for var in vars_rs:
+    l2_loss_rs += tf.nn.l2_loss(var)
+loss_rs = base_loss_rs + l2_loss_rs * l2_weight
+
+# KGE
+base_loss_kge = -scores_kge
+l2_loss_kge = tf.nn.l2_loss(head_embeddings) + tf.nn.l2_loss(tail_embeddings)
+for var in vars_kge:
+    l2_loss_kge += tf.nn.l2_loss(var)
+loss_kge = base_loss_kge + l2_loss_kge * l2_weight
+
+
+optimizer_rs = tf.train.AdamOptimizer(lr_rs).minimize(loss_rs)
+optimizer_kge = tf.train.AdamOptimizer(lr_kge).minimize(loss_kge)
+
+
+def train_rs(sess, feed_dict):
+    return sess.run([optimizer_rs, loss_rs], feed_dict)
+
+def train_kge(sess, feed_dict):
+    return sess.run([optimizer_kge, loss_kge], feed_dict)
+
+def print_eval(sess, labels, feed_dict):
+    labels, scores = sess.run([labels, scores_normalized], feed_dict)
+    auc = roc_auc_score(y_true=labels, y_score=scores)
+    predictions = [1 if i >= 0.5 else 0 for i in scores]
+    acc = np.mean(np.equal(predictions, labels))
+    return auc, acc
+
+def get_scores(sess, feed_dict):
+    return sess.run([item_indices, scores_normalized], feed_dict)
+
+
+def get_user_record(data, is_train):
+    user_history_dict = dict()
+    for interaction in data:
+        user = interaction[0]
+        item = interaction[1]
+        label = interaction[2]
+        if is_train or label == 1:
+            if user not in user_history_dict:
+                user_history_dict[user] = set()
+            user_history_dict[user].add(item)
+    return user_history_dict
+
+
+
+def get_feed_dict_for_rs(data, start, end):
+    feed_dict = {user_indices: data[start:end, 0],
+                 item_indices: data[start:end, 1],
+                 labels: data[start:end, 2],
+                 movie_titles: data[start:end, 3:],
+                 head_indices: data[start:end, 1]}
+    return feed_dict
+
+
+def get_feed_dict_for_kge(kg, start, end):
+    feed_dict = {item_indices: kg[start:end, 0],
+                 head_indices: kg[start:end, 0],
+                 movie_titles: kg[start:end, 3:],
+                 relation_indices: kg[start:end, 1],
+                 tail_indices: kg[start:end, 2]}
+    return feed_dict
+
+user_num=100
+k_list = [1, 2, 5, 10, 20, 50, 100]
+train_record = get_user_record(train_data, True)
+test_record = get_user_record(test_data, False)
+user_list = list(set(train_record.keys()) & set(test_record.keys()))
+if len(user_list) > user_num:
+    user_list = np.random.choice(user_list, size=user_num, replace=False)
+item_set = set(list(range(n_item)))
+
+
+def topk_eval(sess, user_list, train_record, test_record, item_set, k_list):
+    precision_list = {k: [] for k in k_list}
+    recall_list = {k: [] for k in k_list}
+
+    for user in user_list:
+        test_item_list = list(item_set - train_record[user])
+        item_score_map = dict()
+        items, scores = get_scores(sess, {user_indices: [user] * len(test_item_list),
+                                                item_indices: test_item_list,
+                                                movie_titles: test_data[test_item_list, 3:],
+                                                head_indices: test_item_list})
+        for item, score in zip(items, scores):
+            item_score_map[item] = score
+        item_score_pair_sorted = sorted(item_score_map.items(), key=lambda x: x[1], reverse=True)
+        item_sorted = [i[0] for i in item_score_pair_sorted]
+
+        for k in k_list:
+            hit_num = len(set(item_sorted[:k]) & test_record[user])
+            precision_list[k].append(hit_num / k)
+            recall_list[k].append(hit_num / len(test_record[user]))
+
+    precision = [np.mean(precision_list[k]) for k in k_list]
+    recall = [np.mean(recall_list[k]) for k in k_list]
+    f1 = [2 / (1 / precision[i] + 1 / recall[i]) for i in range(len(k_list))]
+
+    return precision, recall, f1
+
+
+with tf.Session() as sess:
+    sess.run(tf.global_variables_initializer())
+    for step in range(n_epochs):
+        # RS training
+        np.random.shuffle(train_data)
+        start = 0
+        
+        while start < train_data.shape[0]:
+            _, loss = train_rs(sess, get_feed_dict_for_rs(train_data, start, start+batch_size))
+            start += batch_size
+            if show_loss:
+                print(loss)
+
+        # KGE training
+        if step % kge_interval == 0:
+            np.random.shuffle(kg)
+            start = 0
+            while start<kg.shape[0]:
+                _, rmse = train_kge(sess, get_feed_dict_for_kge(kg, start, start+batch_size))
+                start += batch_size
+                if show_loss:
+                    print(rmse)
+
+        # CTR evaluation
+        train_auc, train_acc = print_eval(sess, labels, get_feed_dict_for_rs(train_data, 0, train_data.shape[0]))
+        eval_auc, eval_acc = print_eval(sess, labels, get_feed_dict_for_rs(eval_data, 0, eval_data.shape[0]))
+        test_auc, test_acc = print_eval(sess, labels, get_feed_dict_for_rs(test_data, 0, test_data.shape[0]))
+
+        print('epoch %d    train auc: %.4f  acc: %.4f    eval auc: %.4f  acc: %.4f    test auc: %.4f  acc: %.4f'
+              % (step, train_auc, train_acc, eval_auc, eval_acc, test_auc, test_acc))
+        
+        
+        # top-K evaluation
+        if show_topk:
+            precision, recall, f1 = topk_eval(
+                sess, user_list, train_record, test_record, item_set, k_list)
+            print('precision: ', end='')
+            for i in precision:
+                print('%.4f\t' % i, end='')
+            print()
+            print('recall: ', end='')
+            for i in recall:
+                print('%.4f\t' % i, end='')
+            print()
+            print('f1: ', end='')
+            for i in f1:
+                print('%.4f\t' % i, end='')
+            print('\n')
+        
+
+
+
+
+
+    
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
